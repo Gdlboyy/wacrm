@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { randomBytes } from 'crypto'
 import { createClient } from '@/lib/supabase/server'
 import { createClient as createAdminClient } from '@supabase/supabase-js'
 import {
@@ -6,6 +7,7 @@ import {
   subscribeWabaToApp,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
+import { verifyYCloudApiKey } from '@/lib/whatsapp/ycloud-api'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
 
 /**
@@ -87,7 +89,7 @@ export async function GET() {
 
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
-      .select('phone_number_id, access_token, status')
+      .select('provider, phone_number_id, access_token, ycloud_api_key, ycloud_whatsapp_number, ycloud_webhook_secret, status')
       .eq('account_id', accountId)
       .maybeSingle()
 
@@ -108,6 +110,47 @@ export async function GET() {
         },
         { status: 200 }
       )
+    }
+
+    if (config.provider === 'ycloud') {
+      let ycloudApiKey: string
+      let webhookSecret = ''
+      try {
+        ycloudApiKey = decrypt(config.ycloud_api_key)
+        if (config.ycloud_webhook_secret) webhookSecret = decrypt(config.ycloud_webhook_secret)
+      } catch (err) {
+        console.error('[whatsapp/config GET] YCloud token decryption failed:', err)
+        return NextResponse.json(
+          {
+            connected: false,
+            reason: 'token_corrupted',
+            needs_reset: true,
+            message:
+              'The stored YCloud API key cannot be decrypted with the current ENCRYPTION_KEY. This usually means the key changed, or it differs between environments. Click "Reset Configuration" below, then re-save.',
+          },
+          { status: 200 }
+        )
+      }
+
+      try {
+        await verifyYCloudApiKey({ apiKey: ycloudApiKey })
+        return NextResponse.json({
+          connected: true,
+          phone_info: { display_phone_number: config.ycloud_whatsapp_number },
+          ycloud_webhook_secret: webhookSecret,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown YCloud API error'
+        console.error('[whatsapp/config GET] YCloud API verification failed:', message)
+        return NextResponse.json(
+          {
+            connected: false,
+            reason: 'meta_api_error',
+            message: `YCloud API rejected the credentials: ${message}`,
+          },
+          { status: 200 }
+        )
+      }
     }
 
     // Try to decrypt the stored token with the current ENCRYPTION_KEY.
@@ -185,6 +228,12 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
+    const provider: 'meta' | 'ycloud' = body.provider === 'ycloud' ? 'ycloud' : 'meta'
+
+    if (provider === 'ycloud') {
+      return saveYCloudConfig({ supabase, accountId, userId: user.id, body })
+    }
+
     const { phone_number_id, waba_id, access_token, verify_token, pin } = body
 
     if (!access_token || !phone_number_id) {
@@ -354,10 +403,17 @@ export async function POST(request: Request) {
     // store the credentials and the error so the UI can guide the
     // user through a retry.
     const baseRow = {
+      provider: 'meta' as const,
       phone_number_id,
       waba_id: waba_id || null,
       access_token: encryptedAccessToken,
       verify_token: encryptedVerifyToken,
+      // Clear any leftover YCloud fields — a row can only be "live" as
+      // one provider at a time, and the provider_fields_check constraint
+      // (migration 037) requires meta rows to look purely Meta-shaped.
+      ycloud_api_key: null,
+      ycloud_whatsapp_number: null,
+      ycloud_webhook_secret: null,
       status: registrationError ? 'disconnected' : 'connected',
       connected_at: registrationError ? null : new Date().toISOString(),
       registered_at: registrationError ? null : registeredAt,
@@ -429,6 +485,130 @@ export async function POST(request: Request) {
     console.error('Error in WhatsApp config POST:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
+}
+
+/**
+ * YCloud branch of POST /api/whatsapp/config.
+ *
+ * Much simpler than the Meta path: no /register or /subscribed_apps
+ * dance (YCloud has no equivalent — an API key is live the moment
+ * it's valid), no Meta-signature webhook verification. Ownership
+ * conflict on `ycloud_whatsapp_number` is checked the same way the
+ * Meta path checks `phone_number_id` (see migration 015's comment on
+ * why that matters for webhook routing).
+ */
+async function saveYCloudConfig(args: {
+  supabase: Awaited<ReturnType<typeof createClient>>
+  accountId: string
+  userId: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any
+}) {
+  const { supabase, accountId, userId, body } = args
+  const { ycloud_api_key, ycloud_whatsapp_number } = body
+
+  if (!ycloud_api_key || !ycloud_whatsapp_number) {
+    return NextResponse.json(
+      { error: 'ycloud_api_key and ycloud_whatsapp_number are required' },
+      { status: 400 }
+    )
+  }
+
+  const normalizedNumber = String(ycloud_whatsapp_number).trim()
+
+  const { data: claimed, error: claimedError } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('account_id')
+    .eq('ycloud_whatsapp_number', normalizedNumber)
+    .neq('account_id', accountId)
+    .maybeSingle()
+
+  if (claimedError) {
+    console.error('Error checking ycloud_whatsapp_number ownership:', claimedError)
+    return NextResponse.json({ error: 'Failed to validate configuration' }, { status: 500 })
+  }
+
+  if (claimed) {
+    return NextResponse.json(
+      {
+        error:
+          'This WhatsApp number is already connected via YCloud on another account on this instance.',
+      },
+      { status: 409 }
+    )
+  }
+
+  try {
+    await verifyYCloudApiKey({ apiKey: ycloud_api_key })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown YCloud API error'
+    console.error('YCloud API verification failed during save:', message)
+    return NextResponse.json({ error: `YCloud API error: ${message}` }, { status: 400 })
+  }
+
+  const { data: existing } = await supabase
+    .from('whatsapp_config')
+    .select('id, ycloud_webhook_secret')
+    .eq('account_id', accountId)
+    .maybeSingle()
+
+  // Reuse the existing webhook secret across saves (rotating it would
+  // silently break whatever URL the user already pasted into YCloud's
+  // console) — only mint a fresh one the first time this account
+  // connects via YCloud.
+  let webhookSecret: string
+  if (existing?.ycloud_webhook_secret) {
+    try {
+      webhookSecret = decrypt(existing.ycloud_webhook_secret)
+    } catch {
+      webhookSecret = randomBytes(24).toString('hex')
+    }
+  } else {
+    webhookSecret = randomBytes(24).toString('hex')
+  }
+
+  const baseRow = {
+    provider: 'ycloud' as const,
+    phone_number_id: null,
+    waba_id: null,
+    access_token: null,
+    verify_token: null,
+    ycloud_api_key: encrypt(ycloud_api_key),
+    ycloud_whatsapp_number: normalizedNumber,
+    ycloud_webhook_secret: encrypt(webhookSecret),
+    status: 'connected' as const,
+    connected_at: new Date().toISOString(),
+    registered_at: null,
+    subscribed_apps_at: null,
+    last_registration_error: null,
+    updated_at: new Date().toISOString(),
+  }
+
+  if (existing) {
+    const { error: updateError } = await supabase
+      .from('whatsapp_config')
+      .update(baseRow)
+      .eq('account_id', accountId)
+    if (updateError) {
+      console.error('Error updating ycloud whatsapp_config:', updateError)
+      return NextResponse.json({ error: 'Failed to update configuration' }, { status: 500 })
+    }
+  } else {
+    const { error: insertError } = await supabase
+      .from('whatsapp_config')
+      .insert({ account_id: accountId, user_id: userId, ...baseRow })
+    if (insertError) {
+      console.error('Error inserting ycloud whatsapp_config:', insertError)
+      return NextResponse.json({ error: 'Failed to save configuration' }, { status: 500 })
+    }
+  }
+
+  return NextResponse.json({
+    success: true,
+    saved: true,
+    registered: true,
+    ycloud_webhook_secret: webhookSecret,
+  })
 }
 
 /**

@@ -1,4 +1,5 @@
 import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import { sendTextMessage as sendYCloudTextMessage } from '@/lib/whatsapp/ycloud-api'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import {
   engineSendInteractiveButtons,
@@ -7,6 +8,7 @@ import {
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
+  sanitizePhoneForYCloud,
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
@@ -140,52 +142,74 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const provider: 'meta' | 'ycloud' = config.provider ?? 'meta'
 
-  const attempt = async (phone: string): Promise<string> => {
+  let waMessageId = ''
+  let workingPhone = sanitized
+
+  if (provider === 'ycloud') {
     if (input.kind === 'template') {
-      const r = await sendTemplateMessage({
+      throw new Error(
+        'Template automations are not supported yet for accounts connected via YCloud.'
+      )
+    }
+    // No Meta-sandbox trunk-prefix quirk to work around — single
+    // attempt with the `+`-prefixed number YCloud expects.
+    const ycloudApiKey = decrypt(config.ycloud_api_key)
+    workingPhone = sanitizePhoneForYCloud(contact.phone)
+    const r = await sendYCloudTextMessage({
+      apiKey: ycloudApiKey,
+      from: config.ycloud_whatsapp_number,
+      to: workingPhone,
+      text: input.text,
+    })
+    waMessageId = r.messageId
+  } else {
+    const accessToken = decrypt(config.access_token)
+
+    const attempt = async (phone: string): Promise<string> => {
+      if (input.kind === 'template') {
+        const r = await sendTemplateMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: phone,
+          templateName: input.templateName,
+          language: input.language,
+          params: input.params,
+        })
+        return r.messageId
+      }
+      const r = await sendTextMessage({
         phoneNumberId: config.phone_number_id,
         accessToken,
         to: phone,
-        templateName: input.templateName,
-        language: input.language,
-        params: input.params,
+        text: input.text,
       })
       return r.messageId
     }
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: input.text,
-    })
-    return r.messageId
-  }
 
-  // Same phone-variant retry as /api/whatsapp/send — Meta sandbox and
-  // numbers registered with/without a trunk 0 both require this to
-  // reliably land a message.
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+    // Same phone-variant retry as /api/whatsapp/send — Meta sandbox and
+    // numbers registered with/without a trunk 0 both require this to
+    // reliably land a message.
+    const variants = phoneVariants(sanitized)
+    let lastError: unknown = null
+    for (const v of variants) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!isRecipientNotAllowedError(msg)) throw err
+        lastError = err
+      }
     }
-  }
-  if (lastError) throw lastError
+    if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    if (workingPhone !== sanitized) {
+      await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    }
   }
 
   // Persist the sent message so it appears in the inbox with a real

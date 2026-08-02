@@ -269,16 +269,23 @@ export interface MessageReaction {
 export interface WhatsAppConfig {
   id: string;
   user_id: string;
-  phone_number_id: string;
+  /** 'meta' (default, Cloud API) or 'ycloud' (BSP, no Business Manager needed). */
+  provider: 'meta' | 'ycloud';
+  phone_number_id: string | null;
   waba_id?: string;
-  access_token: string;
+  access_token: string | null;
   verify_token?: string;
+  /** Encrypted YCloud API key. Only set when provider === 'ycloud'. */
+  ycloud_api_key?: string | null;
+  /** E.164 WhatsApp number tied to the YCloud API key — routes inbound webhooks. */
+  ycloud_whatsapp_number?: string | null;
   status: 'connected' | 'disconnected';
   connected_at?: string;
   /**
    * Set when POST /{phone_number_id}/register last succeeded. NULL
    * means the number was saved but never actually subscribed for
    * webhooks on Meta's side — inbound events will be silently lost.
+   * Meaningless for provider === 'ycloud' (no equivalent step).
    */
   registered_at?: string;
   /** Set when POST /{waba_id}/subscribed_apps last succeeded. */

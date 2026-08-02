@@ -70,6 +70,16 @@ export function WhatsAppConfig() {
   const [pin, setPin] = useState('');
   const [tokenEdited, setTokenEdited] = useState(false);
 
+  // Provider toggle — 'meta' (Cloud API, requires Business Manager) or
+  // 'ycloud' (BSP, API-key only, no Business Manager step). Each account
+  // connects through exactly one provider at a time (whatsapp_config is
+  // still one row per account_id — see migration 037).
+  const [provider, setProvider] = useState<'meta' | 'ycloud'>('meta');
+  const [ycloudApiKey, setYcloudApiKey] = useState('');
+  const [ycloudApiKeyEdited, setYcloudApiKeyEdited] = useState(false);
+  const [ycloudWhatsappNumber, setYcloudWhatsappNumber] = useState('');
+  const [ycloudWebhookSecret, setYcloudWebhookSecret] = useState('');
+
   // True once /register has succeeded on Meta's side (timestamp set
   // in the row). When false, the saved config is metadata-only and
   // Meta will silently drop every inbound event — that's the
@@ -115,20 +125,29 @@ export function WhatsAppConfig() {
 
       if (data) {
         setConfig(data);
+        setProvider(data.provider === 'ycloud' ? 'ycloud' : 'meta');
         setPhoneNumberId(data.phone_number_id || '');
         setWabaId(data.waba_id || '');
-        setAccessToken(MASKED_TOKEN);
+        setAccessToken(data.provider === 'ycloud' ? '' : MASKED_TOKEN);
         setVerifyToken('');
         setPin('');
         setTokenEdited(false);
+        setYcloudWhatsappNumber(data.ycloud_whatsapp_number || '');
+        setYcloudApiKey(data.ycloud_api_key ? MASKED_TOKEN : '');
+        setYcloudApiKeyEdited(false);
       } else {
         setConfig(null);
+        setProvider('meta');
         setPhoneNumberId('');
         setWabaId('');
         setAccessToken('');
         setVerifyToken('');
         setPin('');
         setTokenEdited(false);
+        setYcloudWhatsappNumber('');
+        setYcloudApiKey('');
+        setYcloudApiKeyEdited(false);
+        setYcloudWebhookSecret('');
       }
       // Clear any stale probe result when reloading the row.
       setRegistrationProbe(null);
@@ -143,6 +162,9 @@ export function WhatsAppConfig() {
             setConnectionStatus('connected');
             setResetReason(null);
             setStatusMessage('');
+            if (typeof payload.ycloud_webhook_secret === 'string') {
+              setYcloudWebhookSecret(payload.ycloud_webhook_secret);
+            }
           } else {
             setConnectionStatus('disconnected');
             setResetReason(payload.needs_reset ? 'token_corrupted' : payload.reason === 'meta_api_error' ? 'meta_api_error' : null);
@@ -182,7 +204,64 @@ export function WhatsAppConfig() {
     fetchConfig(accountId);
   }, [authLoading, profileLoading, user?.id, accountId, fetchConfig]);
 
+  async function handleSaveYCloud() {
+    if (!ycloudWhatsappNumber.trim()) {
+      toast.error('El número de WhatsApp es obligatorio');
+      return;
+    }
+    if (!config && (!ycloudApiKey.trim() || !ycloudApiKeyEdited)) {
+      toast.error('La API key de YCloud es obligatoria');
+      return;
+    }
+
+    try {
+      setSaving(true);
+
+      const payload: Record<string, unknown> = {
+        provider: 'ycloud',
+        ycloud_whatsapp_number: ycloudWhatsappNumber.trim(),
+      };
+
+      if (ycloudApiKeyEdited && ycloudApiKey !== MASKED_TOKEN && ycloudApiKey.trim()) {
+        payload.ycloud_api_key = ycloudApiKey.trim();
+      } else {
+        // Reached only when a saved config already exists (the guard
+        // above rejects an empty/unedited key on first save).
+        toast.error('Vuelve a ingresar la API key de YCloud para guardar cambios');
+        setSaving(false);
+        return;
+      }
+
+      const res = await fetch('/api/whatsapp/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        toast.error(data.error || 'No se pudo guardar la configuración');
+        setSaving(false);
+        return;
+      }
+
+      if (typeof data.ycloud_webhook_secret === 'string') {
+        setYcloudWebhookSecret(data.ycloud_webhook_secret);
+      }
+      toast.success('Conectado con YCloud. Copia la URL del webhook y pégala en tu consola de YCloud.');
+
+      if (accountId) await fetchConfig(accountId);
+    } catch (err) {
+      console.error('Save error:', err);
+      toast.error('No se pudo guardar la configuración');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function handleSave() {
+    if (provider === 'ycloud') return handleSaveYCloud();
+
     if (!phoneNumberId.trim()) {
       toast.error('Phone Number ID is required');
       return;
@@ -287,6 +366,9 @@ export function WhatsAppConfig() {
         setConnectionStatus('connected');
         setResetReason(null);
         setStatusMessage('');
+        if (typeof payload.ycloud_webhook_secret === 'string') {
+          setYcloudWebhookSecret(payload.ycloud_webhook_secret);
+        }
         toast.success(
           payload.phone_info?.verified_name
             ? `Connected to ${payload.phone_info.verified_name}`
@@ -355,6 +437,10 @@ export function WhatsAppConfig() {
       setAccessToken('');
       setVerifyToken('');
       setTokenEdited(false);
+      setYcloudApiKey('');
+      setYcloudWhatsappNumber('');
+      setYcloudApiKeyEdited(false);
+      setYcloudWebhookSecret('');
       setConnectionStatus('disconnected');
       setResetReason(null);
       setStatusMessage('');
@@ -396,6 +482,42 @@ export function WhatsAppConfig() {
       <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       {/* Main config form */}
       <div className="space-y-6">
+        {/* Provider toggle — Meta Cloud API (needs Business Manager) vs
+            YCloud (API key only, no Business Manager). Disabled once a
+            config is saved to avoid an accidental mid-edit switch —
+            use "Reset Configuration" first to change providers. */}
+        <Card>
+          <CardContent className="pt-6">
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant={provider === 'meta' ? 'default' : 'outline'}
+                size="sm"
+                disabled={Boolean(config)}
+                onClick={() => setProvider('meta')}
+                className={provider === 'meta' ? 'bg-primary text-primary-foreground' : 'border-border text-muted-foreground'}
+              >
+                Meta Cloud API
+              </Button>
+              <Button
+                type="button"
+                variant={provider === 'ycloud' ? 'default' : 'outline'}
+                size="sm"
+                disabled={Boolean(config)}
+                onClick={() => setProvider('ycloud')}
+                className={provider === 'ycloud' ? 'bg-primary text-primary-foreground' : 'border-border text-muted-foreground'}
+              >
+                YCloud
+              </Button>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {provider === 'ycloud'
+                ? 'Conecta con tu API key de YCloud — no requiere Meta Business Manager.'
+                : 'Conexión directa con la Cloud API de Meta — requiere configurar una app en Meta Business Manager.'}
+            </p>
+          </CardContent>
+        </Card>
+
         {/* Corrupted-token reset banner */}
         {showResetBanner && (
           <Alert className="bg-amber-950/40 border-amber-600/40">
@@ -456,7 +578,7 @@ export function WhatsAppConfig() {
             without a successful /register call the number won't
             receive inbound events. Surface this dimension separately
             so users don't trust a misleading green banner. */}
-        {config && (
+        {provider === 'meta' && config && (
           <Alert
             className={
               isRegistered
@@ -554,6 +676,111 @@ export function WhatsAppConfig() {
           </Alert>
         )}
 
+        {provider === 'ycloud' ? (
+        <>
+        {/* YCloud credentials */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-foreground">Credenciales de YCloud</CardTitle>
+            <CardDescription className="text-muted-foreground">
+              Consigue tu API key en el dashboard de YCloud (Settings → API Keys).
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-muted-foreground">Número de WhatsApp (E.164)</Label>
+              <Input
+                placeholder="+15551234567"
+                value={ycloudWhatsappNumber}
+                onChange={(e) => setYcloudWhatsappNumber(e.target.value)}
+                className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+              />
+              <p className="text-xs text-muted-foreground">
+                El número conectado a tu cuenta de YCloud, en formato internacional con +.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-muted-foreground">API Key</Label>
+              <div className="relative">
+                <Input
+                  type={showToken ? 'text' : 'password'}
+                  placeholder="Pega aquí tu API key de YCloud"
+                  value={ycloudApiKey}
+                  onChange={(e) => {
+                    setYcloudApiKey(e.target.value);
+                    setYcloudApiKeyEdited(true);
+                  }}
+                  onFocus={() => {
+                    if (ycloudApiKey === MASKED_TOKEN) {
+                      setYcloudApiKey('');
+                      setYcloudApiKeyEdited(true);
+                    }
+                  }}
+                  className="bg-muted border-border text-foreground placeholder:text-muted-foreground pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowToken(!showToken)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  {showToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              </div>
+              {config?.provider === 'ycloud' && !ycloudApiKeyEdited && (
+                <p className="text-xs text-muted-foreground">
+                  API key guardada — deja este campo así o vuelve a escribirla para rotarla.
+                </p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Webhook URL (YCloud) */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-foreground">Webhook de YCloud</CardTitle>
+            <CardDescription className="text-muted-foreground">
+              Pega esta URL en la consola de YCloud (Settings → Webhooks) para recibir mensajes y estados.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              <Label className="text-muted-foreground">Webhook URL</Label>
+              <div className="flex gap-2">
+                <Input
+                  readOnly
+                  value={
+                    ycloudWebhookSecret
+                      ? `${webhookUrl.replace('/webhook', '/ycloud-webhook')}?key=${ycloudWebhookSecret}`
+                      : 'Guarda la configuración para generar la URL'
+                  }
+                  className="bg-muted border-border text-muted-foreground font-mono text-sm"
+                />
+                <Button
+                  variant="outline"
+                  size="icon"
+                  disabled={!ycloudWebhookSecret}
+                  onClick={() => {
+                    navigator.clipboard.writeText(
+                      `${webhookUrl.replace('/webhook', '/ycloud-webhook')}?key=${ycloudWebhookSecret}`
+                    );
+                    toast.success('URL del webhook copiada');
+                  }}
+                  className="shrink-0 border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                >
+                  <Copy className="size-4" />
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Incluye un token secreto (?key=) — no la compartas fuera de la consola de YCloud.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+        </>
+        ) : (
+        <>
         {/* API Credentials */}
         <Card>
           <CardHeader>
@@ -682,6 +909,8 @@ export function WhatsAppConfig() {
             </div>
           </CardContent>
         </Card>
+        </>
+        )}
 
         {/* Action Buttons */}
         <div className="flex flex-wrap gap-3">
@@ -742,6 +971,35 @@ export function WhatsAppConfig() {
 
       {/* Setup Instructions Sidebar */}
       <div>
+        {provider === 'ycloud' ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-foreground text-base">Cómo conectar YCloud</CardTitle>
+            <CardDescription className="text-muted-foreground">
+              Sin pasos de Meta Business Manager.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ol className="list-decimal list-inside space-y-2 text-sm text-muted-foreground">
+              <li>Crea una cuenta en YCloud y conecta tu número de WhatsApp.</li>
+              <li>Copia tu API key desde Settings → API Keys en el dashboard de YCloud.</li>
+              <li>Pega el número (formato +[código país][número]) y la API key aquí, y guarda.</li>
+              <li>Copia la URL del webhook que aparece abajo y pégala en YCloud → Settings → Webhooks.</li>
+            </ol>
+            <div className="mt-4 pt-4 border-t border-border">
+              <a
+                href="https://docs.ycloud.com/reference/whatsapp-send-message"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-sm text-primary hover:text-primary/80 transition-colors"
+              >
+                <ExternalLink className="size-3.5" />
+                Documentación de YCloud
+              </a>
+            </div>
+          </CardContent>
+        </Card>
+        ) : (
         <Card>
           <CardHeader>
             <CardTitle className="text-foreground text-base">{t('setupInstructions')}</CardTitle>
@@ -833,6 +1091,7 @@ export function WhatsAppConfig() {
             </div>
           </CardContent>
         </Card>
+        )}
       </div>
     </div>
     </section>

@@ -7,10 +7,16 @@ import {
   type InteractiveListSection,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api'
+import {
+  sendTextMessage as sendYCloudTextMessage,
+  sendMediaMessage as sendYCloudMediaMessage,
+  type YCloudMediaKind,
+} from '@/lib/whatsapp/ycloud-api'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
+  sanitizePhoneForYCloud,
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
@@ -91,38 +97,52 @@ export async function engineSendText(
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const provider: 'meta' | 'ycloud' = config.provider ?? 'meta'
+  let waMessageId = ''
+  let workingPhone = sanitized
 
-  const attempt = async (phone: string): Promise<string> => {
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
+  if (provider === 'ycloud') {
+    const ycloudApiKey = decrypt(config.ycloud_api_key)
+    workingPhone = sanitizePhoneForYCloud(contact.phone)
+    const r = await sendYCloudTextMessage({
+      apiKey: ycloudApiKey,
+      from: config.ycloud_whatsapp_number,
+      to: workingPhone,
       text: args.text,
     })
-    return r.messageId
-  }
+    waMessageId = r.messageId
+  } else {
+    const accessToken = decrypt(config.access_token)
 
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+    const attempt = async (phone: string): Promise<string> => {
+      const r = await sendTextMessage({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        to: phone,
+        text: args.text,
+      })
+      return r.messageId
     }
-  }
-  if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    const variants = phoneVariants(sanitized)
+    let lastError: unknown = null
+    for (const v of variants) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!isRecipientNotAllowedError(msg)) throw err
+        lastError = err
+      }
+    }
+    if (lastError) throw lastError
+
+    if (workingPhone !== sanitized) {
+      await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    }
   }
 
   const { error: msgErr } = await db.from('messages').insert({
@@ -201,41 +221,58 @@ export async function engineSendMedia(
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const provider: 'meta' | 'ycloud' = config.provider ?? 'meta'
+  let waMessageId = ''
+  let workingPhone = sanitized
 
-  const attempt = async (phone: string): Promise<string> => {
-    const r = await sendMediaMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      kind: args.kind,
+  if (provider === 'ycloud') {
+    const ycloudApiKey = decrypt(config.ycloud_api_key)
+    workingPhone = sanitizePhoneForYCloud(contact.phone)
+    const r = await sendYCloudMediaMessage({
+      apiKey: ycloudApiKey,
+      from: config.ycloud_whatsapp_number,
+      to: workingPhone,
+      kind: args.kind as YCloudMediaKind,
       link: args.link,
       caption: args.caption,
       filename: args.filename,
     })
-    return r.messageId
-  }
+    waMessageId = r.messageId
+  } else {
+    const accessToken = decrypt(config.access_token)
 
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+    const attempt = async (phone: string): Promise<string> => {
+      const r = await sendMediaMessage({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        to: phone,
+        kind: args.kind,
+        link: args.link,
+        caption: args.caption,
+        filename: args.filename,
+      })
+      return r.messageId
     }
-  }
-  if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    const variants = phoneVariants(sanitized)
+    let lastError: unknown = null
+    for (const v of variants) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!isRecipientNotAllowedError(msg)) throw err
+        lastError = err
+      }
+    }
+    if (lastError) throw lastError
+
+    if (workingPhone !== sanitized) {
+      await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    }
   }
 
   // content_type='image'|'video'|'document' — these are already in the
@@ -351,6 +388,12 @@ async function sendInteractiveViaMeta(
     .single()
   if (configErr || !config) {
     throw new Error('WhatsApp not configured for this account')
+  }
+
+  if ((config.provider ?? 'meta') === 'ycloud') {
+    throw new Error(
+      'Interactive (button/list) flow steps are not supported yet for accounts connected via YCloud.'
+    )
   }
 
   const accessToken = decrypt(config.access_token)

@@ -30,6 +30,11 @@ import {
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
+  sendTextMessage as sendYCloudTextMessage,
+  sendMediaMessage as sendYCloudMediaMessage,
+  type YCloudMediaKind,
+} from '@/lib/whatsapp/ycloud-api';
+import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
@@ -38,6 +43,7 @@ import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
+  sanitizePhoneForYCloud,
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
@@ -262,22 +268,42 @@ export async function sendMessageToConversation(
     );
   }
 
-  const accessToken = decrypt(config.access_token);
+  const provider: 'meta' | 'ycloud' = config.provider ?? 'meta';
 
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
-      });
+  // Templates and interactive messages depend on Meta-specific concepts
+  // (pre-approved WABA templates, Meta's interactive message schema)
+  // that aren't implemented over YCloud yet. Fail fast with a clear
+  // reason rather than falling through into Meta-only code below.
+  if (provider === 'ycloud' && (messageType === 'template' || messageType === 'interactive')) {
+    throw new SendMessageError(
+      'provider_unsupported',
+      `"${messageType}" messages aren't supported yet for accounts connected via YCloud. Use text or media (image/video/document/audio) instead.`,
+      400
+    );
+  }
+
+  let accessToken = '';
+  let ycloudApiKey = '';
+  if (provider === 'ycloud') {
+    ycloudApiKey = decrypt(config.ycloud_api_key);
+  } else {
+    accessToken = decrypt(config.access_token);
+
+    // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
+    if (isLegacyFormat(config.access_token)) {
+      void db
+        .from('whatsapp_config')
+        .update({ access_token: encrypt(accessToken) })
+        .eq('id', config.id)
+        .then(({ error }: { error: { message: string } | null }) => {
+          if (error) {
+            console.warn(
+              '[send-message] access_token GCM upgrade failed:',
+              error.message
+            );
+          }
+        });
+    }
   }
 
   // Resolve the reply target to its Meta message_id. The parent must
@@ -329,7 +355,32 @@ export async function sendMessageToConversation(
     templateRow = data ?? null;
   }
 
+  const attemptYCloud = async (phone: string): Promise<string> => {
+    if (isMediaKind) {
+      const result = await sendYCloudMediaMessage({
+        apiKey: ycloudApiKey,
+        from: config.ycloud_whatsapp_number,
+        to: phone,
+        kind: messageType as YCloudMediaKind,
+        link: mediaUrl!,
+        caption: contentText || undefined,
+        filename: filename || undefined,
+        contextMessageId,
+      });
+      return result.messageId;
+    }
+    const result = await sendYCloudTextMessage({
+      apiKey: ycloudApiKey,
+      from: config.ycloud_whatsapp_number,
+      to: phone,
+      text: contentText!,
+      contextMessageId,
+    });
+    return result.messageId;
+  };
+
   const attempt = async (phone: string): Promise<string> => {
+    if (provider === 'ycloud') return attemptYCloud(phone);
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: config.phone_number_id,
@@ -397,9 +448,21 @@ export async function sendMessageToConversation(
 
   // Send via Meta — retry across phone-number variants if Meta rejects
   // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
+  // back to the contact so the next send goes straight through. YCloud
+  // has no equivalent sandbox quirk, so it gets a single attempt with
+  // the `+`-prefixed E.164 number YCloud expects.
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
+  if (provider === 'ycloud') {
+    try {
+      workingPhone = sanitizePhoneForYCloud(contact.phone);
+      waMessageId = await attempt(workingPhone);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown YCloud API error';
+      console.error('[send-message] YCloud send failed:', message);
+      throw new SendMessageError('ycloud_error', `YCloud API error: ${message}`, 502);
+    }
+  } else {
   try {
     const variants = phoneVariants(sanitizedPhone);
     let lastError: unknown = null;
@@ -429,8 +492,14 @@ export async function sendMessageToConversation(
     console.error('[send-message] Meta send failed for all variants:', message);
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
+  }
 
-  if (workingPhone !== sanitizedPhone) {
+  // Meta-only: the phone-variant retry above may have found a working
+  // trunk-prefix variant worth persisting. YCloud's `workingPhone` is
+  // just the same number in `+`-prefixed form, not a corrected variant
+  // — skip the compare-and-update so it doesn't rewrite the contact's
+  // phone format on every single YCloud send.
+  if (provider === 'meta' && workingPhone !== sanitizedPhone) {
     console.log(
       `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
     );

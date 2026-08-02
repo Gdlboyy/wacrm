@@ -41,6 +41,19 @@ export function isValidE164(phone: string): boolean {
 }
 
 /**
+ * Sanitize a phone number for the YCloud WhatsApp API.
+ *
+ * Unlike Meta's Cloud API (digits only, see `sanitizePhoneForMeta`),
+ * YCloud's `to`/`from` fields want a `+`-prefixed E.164 string. Strips
+ * everything but digits, then re-adds the leading `+`.
+ */
+export function sanitizePhoneForYCloud(phone: string): string {
+  if (!phone) return ''
+  const digits = phone.replace(/\D/g, '')
+  return digits ? `+${digits}` : ''
+}
+
+/**
  * Generate plausible phone number variants for retry when Meta's
  * sandbox rejects a number with error #131030 ("not in allowed list").
  *
