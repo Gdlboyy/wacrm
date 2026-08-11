@@ -174,7 +174,7 @@ async function processYCloudEvent(
   }
 
   if (eventType === 'whatsapp.message.updated') {
-    await handleStatusUpdate(wm)
+    await handleStatusUpdate(wm, config)
     return
   }
 
@@ -193,7 +193,8 @@ async function processYCloudEvent(
   console.warn('[ycloud-webhook] unrecognized event, ignoring. type=', eventType)
 }
 
-async function handleStatusUpdate(wm: YCloudWhatsAppMessage) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleStatusUpdate(wm: YCloudWhatsAppMessage, config: any) {
   if (!wm.id || !wm.status) return
 
   const ALLOWED_STATUSES = new Set(['sending', 'sent', 'delivered', 'read', 'failed'])
@@ -202,21 +203,111 @@ async function handleStatusUpdate(wm: YCloudWhatsAppMessage) {
     return
   }
 
+  const db = supabaseAdmin()
+
   // message_id isn't unique (same reasoning as the Meta webhook — see
-  // its migration-009 comment), so this updates 0..N rows.
-  const { error } = await supabaseAdmin()
+  // its migration-009 comment), so this updates 0..N rows. `.select('id')`
+  // lets us tell "matched nothing" apart from "matched and updated" below.
+  const { data: updatedRows, error } = await db
     .from('messages')
     .update({ status: wm.status })
     .eq('message_id', wm.id)
+    .select('id')
 
   if (error) {
     console.error('[ycloud-webhook] error updating message status:', error)
+    return
   }
 
   if (wm.status === 'failed') {
     const reason = wm.errorMessage || wm.whatsappApiError?.message
     if (reason) console.warn('[ycloud-webhook] message failed:', wm.id, reason)
   }
+
+  // A status update for a message wacrm never inserted means it was
+  // sent from outside wacrm — a human agent typing directly in the
+  // YCloud dashboard/app, since anything sent through wacrm itself (or
+  // through a bot calling the public API) already gets its own row at
+  // send time. Register it now so the conversation history in wacrm
+  // stays complete.
+  if (!updatedRows || updatedRows.length === 0) {
+    await recordExternalOutboundMessage(wm, config)
+  }
+}
+
+/**
+ * Insert a message wacrm first learns about via a `whatsapp.message.updated`
+ * status event (i.e. it wasn't sent through wacrm or the public API).
+ * Always tagged `sender_type: 'agent'` — a human wrote it directly on
+ * the WhatsApp/YCloud side.
+ */
+async function recordExternalOutboundMessage(
+  wm: YCloudWhatsAppMessage,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  config: any
+) {
+  const db = supabaseAdmin()
+  const accountId = config.account_id as string
+
+  const ourNumber = normalizePhone(config.ycloud_whatsapp_number ?? '')
+  const from = normalizePhone(wm.from ?? '')
+  const customerPhone = from === ourNumber ? wm.to : wm.from
+  if (!customerPhone) {
+    console.warn('[ycloud-webhook] could not resolve customer phone for external outbound message', wm.id)
+    return
+  }
+
+  // Requires an existing contact/conversation (created by a prior
+  // inbound message). A brand-new contact with no prior conversation
+  // shouldn't happen here — nobody messages a customer who has never
+  // written in first, on an inbound-only account like this one.
+  const contact = await findExistingContact(db, accountId, customerPhone)
+  if (!contact) {
+    console.warn('[ycloud-webhook] no contact found for external outbound message, skipping', wm.id)
+    return
+  }
+
+  const { data: existingConvRows, error: findConvError } = await db
+    .from('conversations')
+    .select('*')
+    .eq('account_id', accountId)
+    .eq('contact_id', contact.id)
+    .order('created_at', { ascending: true })
+    .limit(1)
+
+  const conversation = existingConvRows?.[0]
+  if (findConvError || !conversation) {
+    console.error('[ycloud-webhook] error finding conversation for external outbound message:', findConvError)
+    return
+  }
+
+  const { contentType, contentText, mediaUrl } = parseContent(wm)
+
+  const { error: msgError } = await db.from('messages').insert({
+    conversation_id: conversation.id,
+    sender_type: 'agent',
+    content_type: contentType,
+    content_text: contentText,
+    media_url: mediaUrl,
+    message_id: wm.id,
+    status: wm.status,
+    created_at: wm.createTime ? new Date(wm.createTime).toISOString() : new Date().toISOString(),
+  })
+
+  if (msgError) {
+    console.error('[ycloud-webhook] error inserting external outbound message:', msgError)
+    return
+  }
+
+  await db
+    .from('conversations')
+    .update({
+      last_message_text: contentText || `[${contentType}]`,
+      last_message_at: new Date().toISOString(),
+      status: 'open',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversation.id)
 }
 
 function parseContent(wm: YCloudWhatsAppMessage): {

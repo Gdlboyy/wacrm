@@ -216,7 +216,11 @@
       "interactiveReply": "[Interactive reply]",
       "unsupported": "[Unsupported message type]",
       "aiBadge": "AI",
-      "aiBadgeTitle": "Sent automatically by the AI assistant"
+      "aiBadgeTitle": "Sent automatically by the AI assistant",
+      "botBadge": "Bot",
+      "botBadgeTitle": "Sent by the n8n chatbot",
+      "agentBadge": "Agent",
+      "agentBadgeTitle": "Sent by a human agent"
     },
     "actions": {
       "reply": "Reply",
@@ -1598,7 +1602,7 @@
       "nameLabel": "Name",
       "namePlaceholder": "e.g. Zapier automation",
       "scopesLabel": "Scopes",
-      "scopesHint": "A key with no scopes can still call <code className=\"text-[11px]\">GET /api/v1/me</code> to verify it works.",
+      "scopesHint": "A key with no scopes can still call <code>GET /api/v1/me</code> to verify it works.",
       "cancel": "Cancel",
       "creating": "Creating…",
       "createKey": "Create key",

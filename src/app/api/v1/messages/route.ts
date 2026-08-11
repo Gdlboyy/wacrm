@@ -23,7 +23,10 @@
 //       "params": ["A123"] | { "body": [...] }   // array = positional body; object = structured
 //     },
 //     "reply_to_message_id": "<uuid>",       // optional, must be in the same conversation
-//     "name": "Jane Doe"                     // optional, names a newly-created contact
+//     "name": "Jane Doe",                    // optional, names a newly-created contact
+//     "sender_type": "agent" | "bot"         // optional, default "agent" — use "bot" for
+//                                             // automations (e.g. an n8n chatbot) so the
+//                                             // inbox tags it distinctly from a human agent
 //   }
 //
 // Response (201):
@@ -59,6 +62,7 @@ export async function POST(request: Request) {
     }
 
     const type = typeof body.type === 'string' ? body.type : 'text';
+    const senderType = body.sender_type === 'bot' ? 'bot' : 'agent';
 
     // Unpack the optional `template` object into the flat params the
     // send core expects. `params` as an array → legacy positional body
@@ -124,6 +128,7 @@ export async function POST(request: Request) {
           typeof body.reply_to_message_id === 'string'
             ? body.reply_to_message_id
             : null,
+        senderType,
       }
     );
 

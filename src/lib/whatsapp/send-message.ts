@@ -90,6 +90,15 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * Who the message is recorded as coming from. Defaults to `'agent'`
+   * (the dashboard's own send action). The public API also accepts
+   * `'bot'`, for automations like an n8n chatbot that send through this
+   * endpoint instead of hitting the WhatsApp provider directly — so the
+   * inbox can show a distinct badge instead of lumping every non-
+   * customer send together as a human agent.
+   */
+  senderType?: 'agent' | 'bot';
 }
 
 export interface SendMessageResult {
@@ -203,6 +212,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    senderType = 'agent',
   } = params;
 
   if (!conversationId) {
@@ -521,7 +531,7 @@ export async function sendMessageToConversation(
     .from('messages')
     .insert({
       conversation_id: conversationId,
-      sender_type: 'agent',
+      sender_type: senderType,
       content_type: messageType,
       content_text: interactiveBody ?? contentText ?? null,
       media_url: mediaUrl || null,
