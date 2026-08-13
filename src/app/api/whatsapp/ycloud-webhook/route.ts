@@ -239,7 +239,9 @@ async function handleStatusUpdate(wm: YCloudWhatsAppMessage, config: any) {
  * Insert a message wacrm first learns about via a `whatsapp.message.updated`
  * status event (i.e. it wasn't sent through wacrm or the public API).
  * Always tagged `sender_type: 'agent'` — a human wrote it directly on
- * the WhatsApp/YCloud side.
+ * the WhatsApp/YCloud side. Creates the contact/conversation if this is
+ * the first time wacrm sees this customer (an agent messaging a new
+ * lead first, before any inbound message) — same as processInboundMessage.
  */
 async function recordExternalOutboundMessage(
   wm: YCloudWhatsAppMessage,
@@ -248,6 +250,7 @@ async function recordExternalOutboundMessage(
 ) {
   const db = supabaseAdmin()
   const accountId = config.account_id as string
+  const configOwnerUserId = config.user_id as string
 
   const ourNumber = normalizePhone(config.ycloud_whatsapp_number ?? '')
   const from = normalizePhone(wm.from ?? '')
@@ -257,15 +260,38 @@ async function recordExternalOutboundMessage(
     return
   }
 
-  // Requires an existing contact/conversation (created by a prior
-  // inbound message). A brand-new contact with no prior conversation
-  // shouldn't happen here — nobody messages a customer who has never
-  // written in first, on an inbound-only account like this one.
-  const contact = await findExistingContact(db, accountId, customerPhone)
+  // An agent can message a brand-new prospect directly (a lead,
+  // a referral) before that person has ever written in — that's NOT
+  // an error case, unlike the comment here used to assume. Create the
+  // contact/conversation the same way processInboundMessage does
+  // instead of dropping the message.
+  let contact = await findExistingContact(db, accountId, customerPhone)
   if (!contact) {
-    console.warn('[ycloud-webhook] no contact found for external outbound message, skipping', wm.id)
-    return
+    const { data: newContact, error: createContactError } = await db
+      .from('contacts')
+      .insert({
+        account_id: accountId,
+        user_id: configOwnerUserId,
+        phone: customerPhone,
+        name: customerPhone,
+      })
+      .select()
+      .single()
+
+    if (createContactError) {
+      if (isUniqueViolation(createContactError)) {
+        contact = await findExistingContact(db, accountId, customerPhone)
+      }
+      if (!contact) {
+        console.error('[ycloud-webhook] error creating contact for external outbound message:', createContactError)
+        return
+      }
+    } else {
+      contact = newContact
+    }
   }
+
+  if (!contact) return
 
   const { data: existingConvRows, error: findConvError } = await db
     .from('conversations')
@@ -275,10 +301,34 @@ async function recordExternalOutboundMessage(
     .order('created_at', { ascending: true })
     .limit(1)
 
-  const conversation = existingConvRows?.[0]
-  if (findConvError || !conversation) {
+  if (findConvError) {
     console.error('[ycloud-webhook] error finding conversation for external outbound message:', findConvError)
     return
+  }
+
+  let conversation = existingConvRows?.[0] ?? null
+  let conversationWasCreated = false
+
+  if (!conversation) {
+    const { data: newConv, error: createConvError } = await db
+      .from('conversations')
+      .insert({ account_id: accountId, user_id: configOwnerUserId, contact_id: contact.id })
+      .select()
+      .single()
+
+    if (createConvError) {
+      console.error('[ycloud-webhook] error creating conversation for external outbound message:', createConvError)
+      return
+    }
+    conversation = newConv
+    conversationWasCreated = true
+  }
+
+  if (conversationWasCreated) {
+    await dispatchWebhookEvent(db, accountId, 'conversation.created', {
+      conversation_id: conversation.id,
+      contact_id: contact.id,
+    })
   }
 
   const { contentType, contentText, mediaUrl } = parseContent(wm)
