@@ -291,6 +291,8 @@ async function recordExternalOutboundMessage(
     }
   }
 
+  if (!contact) return
+
   const { data: existingConvRows, error: findConvError } = await db
     .from('conversations')
     .select('*')
