@@ -317,11 +317,29 @@ async function recordExternalOutboundMessage(
       .single()
 
     if (createConvError) {
-      console.error('[ycloud-webhook] error creating conversation for external outbound message:', createConvError)
-      return
+      // Lost a race: a concurrent event for the same brand-new contact
+      // created the conversation between our lookup and insert, and the
+      // unique index (migration 036) rejected the duplicate. Re-resolve
+      // the winning row instead of dropping the message, same recovery
+      // findOrCreateConversation uses in the Meta webhook (issue #363).
+      if (isUniqueViolation(createConvError)) {
+        const { data: retryRows } = await db
+          .from('conversations')
+          .select('*')
+          .eq('account_id', accountId)
+          .eq('contact_id', contact.id)
+          .order('created_at', { ascending: true })
+          .limit(1)
+        conversation = retryRows?.[0] ?? null
+      }
+      if (!conversation) {
+        console.error('[ycloud-webhook] error creating conversation for external outbound message:', createConvError)
+        return
+      }
+    } else {
+      conversation = newConv
+      conversationWasCreated = true
     }
-    conversation = newConv
-    conversationWasCreated = true
   }
 
   if (conversationWasCreated) {
@@ -484,11 +502,25 @@ async function processInboundMessage(wm: YCloudWhatsAppMessage, config: any) {
       .single()
 
     if (createConvError) {
-      console.error('[ycloud-webhook] error creating conversation:', createConvError)
-      return
+      // Same race-recovery as recordExternalOutboundMessage above.
+      if (isUniqueViolation(createConvError)) {
+        const { data: retryRows } = await db
+          .from('conversations')
+          .select('*')
+          .eq('account_id', accountId)
+          .eq('contact_id', contact.id)
+          .order('created_at', { ascending: true })
+          .limit(1)
+        conversation = retryRows?.[0] ?? null
+      }
+      if (!conversation) {
+        console.error('[ycloud-webhook] error creating conversation:', createConvError)
+        return
+      }
+    } else {
+      conversation = newConv
+      conversationWasCreated = true
     }
-    conversation = newConv
-    conversationWasCreated = true
   }
 
   if (conversationWasCreated) {
